@@ -1,0 +1,68 @@
+# Uptime check, every 5 minutes, from GitHub's machines (i.e. from outside our network,
+# so it notices when the home server or its tunnel is down, not just the app).
+#
+# A target that fails 3 checks in a row opens an issue assigned to the on-call person;
+# GitHub emails them. When it answers again the issue is closed with a comment, which
+# emails them again. One open issue per target, so a long outage is one email, not 300.
+#
+# Targets live in the MONITOR_TARGETS secret, one "name|url" per line, so internal
+# addresses don't sit in this public repo. (Public so the 5-minute schedule is free.)
+name: Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  actions: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TARGETS: ${{ secrets.MONITOR_TARGETS }}
+      ONCALL: c3730915
+    steps:
+      - name: Check targets
+        run: |
+          gh label create down --color B60205 --description "Target is unreachable" 2>/dev/null || true
+          echo "$TARGETS" | while IFS='|' read -r name url; do
+            [ -z "$name" ] && continue
+            code=000
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -A 'quacko-monitor' "$url" || true)
+              case "$code" in 2*|3*) break ;; esac
+              [ "$attempt" -lt 3 ] && sleep 20
+            done
+            title="DOWN: $name"
+            open=$(gh issue list --label down --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+            case "$code" in
+              2*|3*)
+                echo "up   $name ($code)"
+                if [ -n "$open" ]; then
+                  gh issue close "$open" --comment "@$ONCALL ✅ **$name** is back up (HTTP $code) as of $(date -u '+%Y-%m-%d %H:%M UTC')."
+                fi ;;
+              *)
+                echo "DOWN $name ($code)"
+                if [ -z "$open" ]; then
+                  gh issue create --title "$title" --label down --assignee "$ONCALL" --body "@$ONCALL 🔴 **$name** failed 3 checks in a row (last HTTP status: \`$code\`; 000 means no answer at all) at $(date -u '+%Y-%m-%d %H:%M UTC').
+
+          This issue closes itself when it answers again. Runbook: \`quacko_app/docs/deployment/self-host.md\`."
+                fi ;;
+            esac
+          done
+
+      # GitHub switches off scheduled workflows in a repo with no activity for 60 days;
+      # re-enabling on every run keeps the monitor from silently going quiet.
+      - name: Keep the schedule alive
+        if: always()
+        run: gh api -X PUT "repos/$GH_REPO/actions/workflows/monitor.yml/enable" || true
